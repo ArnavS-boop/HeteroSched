@@ -1,0 +1,62 @@
+{
+    "ablations": [
+        {
+            "id": "ABLATION_0",
+            "label": "Baseline (Round-Robin CPU/GPU)",
+            "enable_tier1_heuristic": false,
+            "enable_tier2_predictor": false,
+            "enable_dynamic_penalties": false,
+            "enable_cross_layer_priority": false
+        },
+        {
+            "id": "ABLATION_1",
+            "label": "Tier-1 Heuristic Only",
+            "enable_tier1_heuristic": true,
+            "enable_tier2_predictor": false,
+            "enable_dynamic_penalties": false,
+            "enable_cross_layer_priority": false
+        },
+        {
+            "id": "ABLATION_2",
+            "label": "Tier-1 + Tier-2 ML Predictor",
+            "enable_tier1_heuristic": true,
+            "enable_tier2_predictor": true,
+            "enable_dynamic_penalties": false,
+            "enable_cross_layer_priority": false
+        },
+        {
+            "id": "ABLATION_3",
+            "label": "Tier-1 + Tier-2 + Dynamic Penalties",
+            "enable_tier1_heuristic": true,
+            "enable_tier2_predictor": true,
+            "enable_dynamic_penalties": true,
+            "enable_cross_layer_priority": false
+        },
+        {
+            "id": "HETEROSCHED_FULL",
+            "label": "HeteroSched Full Pipeline",
+            "enable_tier1_heuristic": true,
+            "enable_tier2_predictor": true,
+            "enable_dynamic_penalties": true,
+            "enable_cross_layer_priority": true
+        }
+    ],
+    "baseline_modes": [
+        {
+            "id": "CPU_ONLY",
+            "label": "CPU-Only Static (FIFO)",
+            "force_device": "cpu"
+        },
+        {
+            "id": "GPU_ONLY",
+            "label": "GPU-Only Static (Default Stream)",
+            "force_device": "gpu"
+        },
+        {
+            "id": "STATIC_RULE",
+            "label": "Static Rule-Based (dim > 512 -> GPU)",
+            "force_device": "rule",
+            "dimension_threshold": 512
+        }
+    ]
+}

@@ -1,0 +1,35 @@
+{
+    "scheduler": {
+        "cpu_workers": 4,
+        "gpu_stream_pool_size": 4,
+        "enable_tier1_heuristic": true,
+        "enable_tier2_predictor": true,
+        "enable_dynamic_penalties": true,
+        "enable_cross_layer_priority": true
+    },
+    "cost_model": {
+        "pcie_bandwidth_peak_gbps": 12.0,
+        "pcie_saturation_threshold": 0.70,
+        "pcie_penalty_gamma": 2.5,
+        "queue_penalty_gamma": 1.5,
+        "queue_max_depth": 32
+    },
+    "tier1_thresholds": {
+        "trivial_flops_ceiling": 100000,
+        "memory_bound_intensity": 0.5,
+        "memory_bound_transfer_bytes": 10485760,
+        "massive_compute_flops_floor": 1000000000,
+        "massive_compute_pcie_ceiling": 0.70
+    },
+    "execution": {
+        "dispatcher_nice_value": -10,
+        "high_priority_stream_index": 0,
+        "cuda_block_dim": 16
+    },
+    "benchmark": {
+        "trace_file": "benchmarks/traces/mixed_trace.json",
+        "output_file": "results.csv",
+        "warmup_iterations": 5,
+        "num_repetitions": 3
+    }
+}
