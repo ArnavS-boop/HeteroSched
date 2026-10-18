@@ -1,0 +1,22 @@
+
+# Local development artifacts
+.venv/
+build/
+results.csv
+ml/dataset.csv
+# Temporary, editor swap, and backup files
+*.bak
+*.swp
+*~
+frontend/src/.*.swp
+
+# Frontend build outputs and dependencies
+frontend/node_modules/
+frontend/dist/
+
+# Python cache & server runtime execution traces
+__pycache__/
+*.py[cod]
+server/__pycache__/
+server/runs/*.csv
+!server/runs/.gitkeep
