@@ -48,6 +48,8 @@ APPROVED_TRACES: Dict[str, Dict[str, Any]] = {
 
 # Process execution lock to prevent concurrent runs
 _BENCHMARK_LOCK = threading.Lock()
+# Dedicated status lock to allow prompt, thread-safe status polling while benchmark executes
+_STATUS_LOCK = threading.Lock()
 _CURRENT_STATUS = {
     "is_running": False,
     "current_trace": None,
@@ -56,7 +58,7 @@ _CURRENT_STATUS = {
 
 
 def get_current_status() -> Dict[str, Any]:
-    with _BENCHMARK_LOCK:
+    with _STATUS_LOCK:
         return dict(_CURRENT_STATUS)
 
 
@@ -106,9 +108,10 @@ def execute_benchmark(trace_key: str, timeout_seconds: float = 60.0) -> Dict[str
     run_id = f"run_{timestamp_str}_{trace_key}"
     output_csv_path = os.path.join(RUNS_DIR, f"{run_id}.csv")
 
-    _CURRENT_STATUS["is_running"] = True
-    _CURRENT_STATUS["current_trace"] = trace_key
-    _CURRENT_STATUS["start_time"] = time.time()
+    with _STATUS_LOCK:
+        _CURRENT_STATUS["is_running"] = True
+        _CURRENT_STATUS["current_trace"] = trace_key
+        _CURRENT_STATUS["start_time"] = time.time()
 
     cmd = [
         BINARY_PATH,
@@ -144,9 +147,10 @@ def execute_benchmark(trace_key: str, timeout_seconds: float = 60.0) -> Dict[str
         raise RuntimeError(f"Failed to execute benchmark: {str(e)}")
     finally:
         elapsed_sec = time.monotonic() - start_mono
-        _CURRENT_STATUS["is_running"] = False
-        _CURRENT_STATUS["current_trace"] = None
-        _CURRENT_STATUS["start_time"] = None
+        with _STATUS_LOCK:
+            _CURRENT_STATUS["is_running"] = False
+            _CURRENT_STATUS["current_trace"] = None
+            _CURRENT_STATUS["start_time"] = None
         _BENCHMARK_LOCK.release()
 
     if returncode != 0:
