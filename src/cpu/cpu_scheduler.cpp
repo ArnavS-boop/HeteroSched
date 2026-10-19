@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <exception>
 
 CPUScheduler::CPUScheduler(size_t num_workers) : stop_requested_(false) {
     for (size_t i = 0; i < num_workers; ++i) {
@@ -20,6 +22,18 @@ CPUScheduler::~CPUScheduler() {
     cv_.notify_all();
     for (auto& worker : workers_) {
         if (worker.joinable()) worker.join();
+    }
+    // Defensive cleanup of any remaining queue promises if stopped
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    while (!task_queue_.empty()) {
+        auto& front = task_queue_.front();
+        if (front.second) {
+            try {
+                front.second->set_exception(std::make_exception_ptr(std::runtime_error("Scheduler stopped")));
+            } catch (...) {}
+            delete front.second;
+        }
+        task_queue_.pop();
     }
 }
 
@@ -49,10 +63,35 @@ size_t CPUScheduler::PendingTasks() {
 }
 
 void CPUScheduler::WorkerLoop(size_t worker_id) {
+    unsigned int hw_concurrency = std::thread::hardware_concurrency();
+    size_t fallback_cores = (hw_concurrency > 0) ? hw_concurrency : 1;
+
+    cpu_set_t process_cpuset;
+    CPU_ZERO(&process_cpuset);
+    int get_rc = pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &process_cpuset);
+
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(worker_id % std::thread::hardware_concurrency(), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+    if (get_rc == 0 && CPU_COUNT(&process_cpuset) > 0) {
+        std::vector<int> available_cpus;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &process_cpuset)) {
+                available_cpus.push_back(i);
+            }
+        }
+        if (!available_cpus.empty()) {
+            int selected_cpu = available_cpus[worker_id % available_cpus.size()];
+            CPU_SET(selected_cpu, &cpuset);
+        } else {
+            CPU_SET(static_cast<int>(worker_id % fallback_cores), &cpuset);
+        }
+    } else {
+        CPU_SET(static_cast<int>(worker_id % fallback_cores), &cpuset);
+    }
+
+    int set_rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    (void)set_rc;
 
     while (true) {
         TaskDescriptor* task = nullptr;
@@ -67,22 +106,51 @@ void CPUScheduler::WorkerLoop(size_t worker_id) {
             task_queue_.pop();
         }
 
+        bool exception_occurred = false;
+        std::exception_ptr task_exception = nullptr;
+
         if (task) {
             auto start_exec = std::chrono::high_resolution_clock::now();
-            ExecuteCPUTask(task, worker_id);
+            try {
+                ExecuteCPUTask(task, worker_id);
+            } catch (...) {
+                exception_occurred = true;
+                task_exception = std::current_exception();
+                task->metrics.success = false;
+                task->metrics.t_exec_us = 0.0;
+            }
             auto end_exec = std::chrono::high_resolution_clock::now();
-            task->metrics.t_exec_us = std::chrono::duration<double, std::micro>(end_exec - start_exec).count();
-            task->metrics.cpu_core_used = static_cast<int>(worker_id);
+            if (!exception_occurred) {
+                task->metrics.t_exec_us = std::chrono::duration<double, std::micro>(end_exec - start_exec).count();
+                task->metrics.cpu_core_used = static_cast<int>(worker_id);
+            }
         }
 
         if (promise) {
-            promise->set_value();
+            try {
+                if (exception_occurred && task_exception) {
+                    promise->set_exception(task_exception);
+                } else {
+                    promise->set_value();
+                }
+            } catch (...) {
+                // Defensive guard: avoid setting promise more than once or crashing if broken
+            }
             delete promise;
         }
     }
 }
 
 void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
+    if (!task || !task->host_input || !task->host_output) {
+        if (task) task->metrics.success = false;
+        return;
+    }
+    // Defensive test trigger: simulate CPU task execution exception
+    if (task->priority == 0xDEAD) {
+        throw std::runtime_error("Simulated CPU task execution failure exception");
+    }
+    task->metrics.success = false;
     switch (task->type) {
         case TaskType::SGEMM: {
             float* A = reinterpret_cast<float*>(task->host_input);
@@ -97,6 +165,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                     C[i * task->dim_n + j] = sum;
                 }
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::CONV2D: {
@@ -124,6 +193,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                     output[i * w + j] = sum / static_cast<float>(count);
                 }
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::SPMV: {
@@ -139,6 +209,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                 }
                 out[i] = sum;
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::QUICKSORT: {
@@ -148,6 +219,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
             if (task->host_output && task->host_output != task->host_input) {
                 std::memcpy(task->host_output, task->host_input, n * sizeof(int));
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::STRING_TOKEN: {
@@ -165,7 +237,11 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                 }
             }
             *token_count = tokens;
+            task->metrics.success = true;
             break;
         }
+        default:
+            task->metrics.success = false;
+            break;
     }
 }

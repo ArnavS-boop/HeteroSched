@@ -17,7 +17,27 @@ struct HeteroSchedConfig {
     bool enable_tier2 = true;
     bool enable_dynamic_penalties = true;
     bool enable_cross_layer_priority = true;
+
+    bool force_cpu = false;
+    bool force_gpu = false;
+    bool static_rule = false;
+    size_t dim_threshold = 512;
 };
+
+inline std::string GetConfigDescription(const HeteroSchedConfig& config) {
+    if (config.force_cpu) return "CPU_ONLY";
+    if (config.force_gpu) return "GPU_ONLY";
+    if (config.static_rule) return "STATIC_RULE(threshold=" + std::to_string(config.dim_threshold) + ")";
+    std::string s = "ADAPTIVE[";
+    if (config.enable_tier1) s += "tier1,";
+    if (config.enable_tier2) s += "tier2,";
+    if (config.enable_dynamic_penalties) s += "dynamic_penalties,";
+    if (config.enable_cross_layer_priority) s += "cross_layer,";
+    if (!s.empty() && s.back() == ',') s.pop_back();
+    if (s == "ADAPTIVE[") s += "baseline";
+    s += "]";
+    return s;
+}
 
 class HeteroSchedRuntime {
 public:

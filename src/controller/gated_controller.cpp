@@ -1,3 +1,4 @@
+#include <atomic>
 #include "gated_controller.h"
 #include "decision_forest_model.h"
 #include <algorithm>
@@ -7,6 +8,12 @@ GatedController::GatedController(std::unique_ptr<DecisionForestModel> model)
 
 ExecutionDevice GatedController::ScheduleTask(TaskDescriptor* task, const RuntimeState& state) {
     auto start_time = std::chrono::high_resolution_clock::now();
+
+    if (task->type == TaskType::QUICKSORT || task->type == TaskType::STRING_TOKEN) {
+        task->metrics.assigned_device = ExecutionDevice::DEVICE_CPU;
+        record_decision_overhead(task, start_time);
+        return ExecutionDevice::DEVICE_CPU;
+    }
 
     if (tier1_enabled_) {
         double operational_intensity = static_cast<double>(task->estimated_flops) /
@@ -57,9 +64,20 @@ ExecutionDevice GatedController::ScheduleTask(TaskDescriptor* task, const Runtim
         return decision;
     }
 
-    task->metrics.assigned_device = ExecutionDevice::DEVICE_CPU;
+    if (tier1_enabled_ && !tier2_enabled_) {
+        task->metrics.assigned_device = ExecutionDevice::DEVICE_CPU;
+        record_decision_overhead(task, start_time);
+        return ExecutionDevice::DEVICE_CPU;
+    }
+
+    // Baseline (both Tier 1 and Tier 2 disabled): Round-Robin between CPU and GPU
+    static std::atomic<size_t> round_robin_counter{0};
+    ExecutionDevice decision = (round_robin_counter.fetch_add(1) % 2 == 0)
+        ? ExecutionDevice::DEVICE_CPU
+        : ExecutionDevice::DEVICE_GPU;
+    task->metrics.assigned_device = decision;
     record_decision_overhead(task, start_time);
-    return ExecutionDevice::DEVICE_CPU;
+    return decision;
 }
 
 void GatedController::record_decision_overhead(TaskDescriptor* task,

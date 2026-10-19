@@ -9,7 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 
-void allocate_task_buffers(TaskDescriptor* task);
+bool allocate_task_buffers(TaskDescriptor* task);
 void free_task_buffers(TaskDescriptor* task);
 void gpu_warmup();
 void print_gpu_info();
@@ -90,7 +90,8 @@ static std::vector<TraceEntry> load_trace(const std::string& path) {
 
 static void write_results_csv(const std::string& path,
                                const std::vector<TaskDescriptor>& tasks,
-                               double total_time_ms) {
+                               double total_time_ms,
+                               const HeteroSchedConfig& config) {
     std::ofstream out(path);
     out << "task_id,type,priority,dim_m,dim_n,dim_k,"
         << "device,t_decision_us,t_transfer_us,t_exec_us,"
@@ -112,43 +113,167 @@ static void write_results_csv(const std::string& path,
     }
 
     out << "\n# total_time_ms," << total_time_ms << "\n";
+    out << "# config," << GetConfigDescription(config) << "\n";
+    out << "# notes,t_total_latency_us measures synchronous end-to-end task completion latency; failed tasks record 0.0\n";
     out.close();
 }
 
-static void print_summary(const std::vector<TaskDescriptor>& tasks, double total_time_ms) {
-    size_t cpu_count = 0, gpu_count = 0;
-    double total_decision = 0, total_exec = 0, total_transfer = 0;
+static void print_summary(const std::vector<TaskDescriptor>& tasks, double total_time_ms, const HeteroSchedConfig& config) {
+    size_t cpu_count = 0, gpu_count = 0, failed_count = 0;
+    double total_decision = 0, total_exec = 0, total_transfer = 0, total_latency = 0;
 
     for (auto& t : tasks) {
+        if (!t.metrics.success) {
+            failed_count++;
+            continue;
+        }
         if (t.metrics.assigned_device == ExecutionDevice::DEVICE_CPU) cpu_count++;
         else gpu_count++;
         total_decision += t.metrics.t_decision_us;
         total_exec += t.metrics.t_exec_us;
         total_transfer += t.metrics.t_transfer_us;
+        total_latency += t.metrics.t_total_latency_us;
     }
 
+    size_t completed = cpu_count + gpu_count;
     std::cout << "\n=== HeteroSched Results ===\n"
+              << "Mode: " << GetConfigDescription(config) << "\n"
               << "Total tasks: " << tasks.size() << "\n"
-              << "  CPU: " << cpu_count << "  GPU: " << gpu_count << "\n"
+              << "  Completed: " << completed << " (CPU: " << cpu_count << "  GPU: " << gpu_count << ")\n"
+              << "  Failed: " << failed_count << "\n"
               << "Total wall time: " << total_time_ms << " ms\n"
-              << "Throughput: " << (tasks.size() / (total_time_ms / 1000.0)) << " tasks/sec\n"
-              << "Avg decision overhead: " << (total_decision / tasks.size()) << " us\n"
-              << "Avg exec time: " << (total_exec / tasks.size()) << " us\n"
-              << "Avg transfer time (GPU tasks): "
-              << (gpu_count > 0 ? total_transfer / gpu_count : 0) << " us\n"
-              << "===========================\n";
+              << "Throughput: " << (completed / (total_time_ms / 1000.0)) << " tasks/sec\n"
+              << "Avg decision overhead: " << (completed > 0 ? total_decision / completed : 0) << " us\n"
+              << "Avg exec time: " << (completed > 0 ? total_exec / completed : 0) << " us\n"
+              << "Avg total completion latency: " << (completed > 0 ? total_latency / completed : 0) << " us\n";
+    if (gpu_count > 0) {
+        std::cout << "Avg transfer time (GPU tasks): " << (total_transfer / gpu_count) << " us\n";
+    } else {
+        std::cout << "Avg transfer time (GPU tasks): N/A (no GPU tasks executed)\n";
+    }
+    std::cout << "===========================\n";
 }
 
 int main(int argc, char** argv) {
     std::string trace_path = "benchmarks/traces/mixed_trace.json";
     std::string output_path = "results.csv";
 
+    HeteroSchedConfig config;
+    config.cpu_workers = 4;
+    config.gpu_stream_pool = 4;
+    config.enable_tier1 = true;
+    config.enable_tier2 = true;
+    config.enable_dynamic_penalties = true;
+    config.enable_cross_layer_priority = true;
+    config.force_cpu = false;
+    config.force_gpu = false;
+    config.static_rule = false;
+    config.dim_threshold = 512;
+
+    bool has_ablation_flag = false;
+    bool has_force_flag = false;
+    bool explicit_tier1 = false;
+    bool explicit_tier2 = false;
+    bool explicit_dynamic = false;
+    bool explicit_cross = false;
+
     for (int i = 1; i < argc; ++i) {
-        if (std::string(argv[i]) == "--trace" && i + 1 < argc) {
+        std::string arg = argv[i];
+        if (arg == "--trace") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --trace requires a file path argument.\n";
+                return 1;
+            }
             trace_path = argv[++i];
-        } else if (std::string(argv[i]) == "--output" && i + 1 < argc) {
+        } else if (arg == "--output") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --output requires a file path argument.\n";
+                return 1;
+            }
             output_path = argv[++i];
+        } else if (arg == "--force-cpu") {
+            if (config.force_gpu || config.static_rule) {
+                std::cerr << "Error: Conflicting scheduling flags specified with --force-cpu.\n";
+                return 1;
+            }
+            config.force_cpu = true;
+            has_force_flag = true;
+        } else if (arg == "--force-gpu") {
+            if (config.force_cpu || config.static_rule) {
+                std::cerr << "Error: Conflicting scheduling flags specified with --force-gpu.\n";
+                return 1;
+            }
+            config.force_gpu = true;
+            has_force_flag = true;
+        } else if (arg == "--static-rule") {
+            if (config.force_cpu || config.force_gpu) {
+                std::cerr << "Error: Conflicting scheduling flags specified with --static-rule.\n";
+                return 1;
+            }
+            config.static_rule = true;
+            has_force_flag = true;
+        } else if (arg == "--dim-threshold") {
+            if (i + 1 >= argc) {
+                std::cerr << "Error: --dim-threshold requires a positive integer argument.\n";
+                return 1;
+            }
+            try {
+                long long val = std::stoll(argv[++i]);
+                if (val <= 0) {
+                    std::cerr << "Error: --dim-threshold must be positive.\n";
+                    return 1;
+                }
+                config.dim_threshold = static_cast<size_t>(val);
+            } catch (...) {
+                std::cerr << "Error: Invalid argument for --dim-threshold: " << argv[i] << "\n";
+                return 1;
+            }
+        } else if (arg == "--no-scheduling" || arg == "--baseline") {
+            has_ablation_flag = true;
+            config.enable_tier1 = false;
+            config.enable_tier2 = false;
+            config.enable_dynamic_penalties = false;
+            config.enable_cross_layer_priority = false;
+        } else if (arg == "--tier1") {
+            has_ablation_flag = true;
+            explicit_tier1 = true;
+        } else if (arg == "--no-tier1") {
+            has_ablation_flag = true;
+            explicit_tier1 = false;
+        } else if (arg == "--tier2") {
+            has_ablation_flag = true;
+            explicit_tier2 = true;
+        } else if (arg == "--no-tier2") {
+            has_ablation_flag = true;
+            explicit_tier2 = false;
+        } else if (arg == "--dynamic-penalties") {
+            has_ablation_flag = true;
+            explicit_dynamic = true;
+        } else if (arg == "--no-dynamic-penalties") {
+            has_ablation_flag = true;
+            explicit_dynamic = false;
+        } else if (arg == "--cross-layer") {
+            has_ablation_flag = true;
+            explicit_cross = true;
+        } else if (arg == "--no-cross-layer") {
+            has_ablation_flag = true;
+            explicit_cross = false;
+        } else {
+            std::cerr << "Error: Unknown argument '" << arg << "'.\n";
+            return 1;
         }
+    }
+
+    if (has_force_flag && has_ablation_flag) {
+        std::cerr << "Error: Forced execution modes (--force-cpu, --force-gpu, --static-rule) cannot be combined with ablation flags.\n";
+        return 1;
+    }
+
+    if (has_ablation_flag && !config.force_cpu && !config.force_gpu && !config.static_rule) {
+        config.enable_tier1 = explicit_tier1;
+        config.enable_tier2 = explicit_tier2;
+        config.enable_dynamic_penalties = explicit_dynamic;
+        config.enable_cross_layer_priority = explicit_cross;
     }
 
     print_gpu_info();
@@ -156,17 +281,18 @@ int main(int argc, char** argv) {
 
     auto trace_entries = load_trace(trace_path);
     if (trace_entries.empty()) {
-        std::cerr << "No tasks loaded from trace. Exiting.\n";
+        std::cerr << "Error: Trace file not found or empty: " << trace_path << "\n";
         return 1;
     }
 
     std::cout << "Loaded " << trace_entries.size() << " tasks from " << trace_path << "\n";
+    std::cout << "Scheduling configuration: " << GetConfigDescription(config) << "\n";
 
     std::vector<TaskDescriptor> tasks(trace_entries.size());
     for (size_t i = 0; i < trace_entries.size(); ++i) {
         auto& e = trace_entries[i];
         auto& t = tasks[i];
-        memset(&t, 0, sizeof(TaskDescriptor));
+        t = TaskDescriptor{};
         t.task_id = e.id;
         t.type = StringToTaskType(e.type);
         t.priority = e.priority;
@@ -176,27 +302,33 @@ int main(int argc, char** argv) {
         t.bytes_in = e.bytes_in;
         t.bytes_out = e.bytes_out;
         t.estimated_flops = e.estimated_flops;
-        allocate_task_buffers(&t);
+        bool alloc_ok = allocate_task_buffers(&t);
+        if (!alloc_ok) {
+            std::cerr << "Warning: Failed to allocate buffers for task ID " << t.task_id << std::endl;
+        }
     }
-
-    HeteroSchedConfig config;
-    config.cpu_workers = 4;
-    config.gpu_stream_pool = 4;
-    config.enable_tier1 = true;
-    config.enable_tier2 = true;
-    config.enable_dynamic_penalties = true;
-    config.enable_cross_layer_priority = true;
 
     HeteroSchedRuntime runtime(config);
 
     auto wall_start = std::chrono::high_resolution_clock::now();
 
+    // Note: The benchmark submission loop below measures synchronous task-completion latency
+    // and serializes CPU task submission; it does not measure multicore throughput.
     for (auto& task : tasks) {
+        if (!task.host_input || !task.host_output) {
+            task.metrics.success = false;
+            task.metrics.t_total_latency_us = 0.0;
+            continue;
+        }
         auto task_start = std::chrono::high_resolution_clock::now();
         runtime.SubmitTask(&task);
         auto task_end = std::chrono::high_resolution_clock::now();
-        task.metrics.t_total_latency_us =
-            std::chrono::duration<double, std::micro>(task_end - task_start).count();
+        if (task.metrics.success) {
+            task.metrics.t_total_latency_us =
+                std::chrono::duration<double, std::micro>(task_end - task_start).count();
+        } else {
+            task.metrics.t_total_latency_us = 0.0;
+        }
     }
 
     runtime.WaitAll();
@@ -204,8 +336,8 @@ int main(int argc, char** argv) {
     auto wall_end = std::chrono::high_resolution_clock::now();
     double total_time_ms = std::chrono::duration<double, std::milli>(wall_end - wall_start).count();
 
-    print_summary(tasks, total_time_ms);
-    write_results_csv(output_path, tasks, total_time_ms);
+    print_summary(tasks, total_time_ms, config);
+    write_results_csv(output_path, tasks, total_time_ms, config);
     std::cout << "Results written to " << output_path << "\n";
 
     for (auto& t : tasks) {
@@ -231,8 +363,49 @@ HeteroSchedRuntime::~HeteroSchedRuntime() {
 }
 
 void HeteroSchedRuntime::SubmitTask(TaskDescriptor* task) {
-    RuntimeState state = telemetry_.Snapshot();
-    ExecutionDevice device = controller_.ScheduleTask(task, state);
+    if (!task) return;
+    if (!task->host_input || !task->host_output) {
+        task->metrics.success = false;
+        return;
+    }
+
+    ExecutionDevice device = ExecutionDevice::DEVICE_CPU;
+
+    if (config_.force_cpu) {
+        auto start_decision = std::chrono::high_resolution_clock::now();
+        device = ExecutionDevice::DEVICE_CPU;
+        auto end_decision = std::chrono::high_resolution_clock::now();
+        task->metrics.assigned_device = device;
+        task->metrics.t_decision_us =
+            std::chrono::duration<double, std::micro>(end_decision - start_decision).count();
+    } else if (config_.force_gpu) {
+        auto start_decision = std::chrono::high_resolution_clock::now();
+        if (task->type == TaskType::QUICKSORT || task->type == TaskType::STRING_TOKEN) {
+            device = ExecutionDevice::DEVICE_CPU;
+        } else {
+            device = ExecutionDevice::DEVICE_GPU;
+        }
+        auto end_decision = std::chrono::high_resolution_clock::now();
+        task->metrics.assigned_device = device;
+        task->metrics.t_decision_us =
+            std::chrono::duration<double, std::micro>(end_decision - start_decision).count();
+    } else if (config_.static_rule) {
+        auto start_decision = std::chrono::high_resolution_clock::now();
+        if (task->type == TaskType::QUICKSORT || task->type == TaskType::STRING_TOKEN) {
+            device = ExecutionDevice::DEVICE_CPU;
+        } else if (task->dim_m > config_.dim_threshold) {
+            device = ExecutionDevice::DEVICE_GPU;
+        } else {
+            device = ExecutionDevice::DEVICE_CPU;
+        }
+        auto end_decision = std::chrono::high_resolution_clock::now();
+        task->metrics.assigned_device = device;
+        task->metrics.t_decision_us =
+            std::chrono::duration<double, std::micro>(end_decision - start_decision).count();
+    } else {
+        RuntimeState state = telemetry_.Snapshot();
+        device = controller_.ScheduleTask(task, state);
+    }
 
     if (device == ExecutionDevice::DEVICE_GPU) {
         ApplyCrossLayerPriority(task, device);
@@ -252,12 +425,13 @@ void HeteroSchedRuntime::SubmitTask(TaskDescriptor* task) {
     } else {
         telemetry_.IncrementCPUQueue();
         auto future = cpu_scheduler_.EnqueueWithFuture(task);
-
-        {
-            std::lock_guard<std::mutex> lock(submit_mutex_);
-            pending_futures_.push_back(std::move(future));
+        try {
+            future.get();
+        } catch (...) {
+            task->metrics.success = false;
+            task->metrics.t_exec_us = 0.0;
+            task->metrics.t_total_latency_us = 0.0;
         }
-
         telemetry_.DecrementCPUQueue();
     }
 }
