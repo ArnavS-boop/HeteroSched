@@ -308,24 +308,27 @@ int main(int argc, char** argv) {
         }
     }
 
-    HeteroSchedConfig config;
-    config.cpu_workers = 4;
-    config.gpu_stream_pool = 4;
-    config.enable_tier1 = true;
-    config.enable_tier2 = true;
-    config.enable_dynamic_penalties = true;
-    config.enable_cross_layer_priority = true;
-
     HeteroSchedRuntime runtime(config);
 
     auto wall_start = std::chrono::high_resolution_clock::now();
 
+    // Note: The benchmark submission loop below measures synchronous task-completion latency
+    // and serializes CPU task submission; it does not measure multicore throughput.
     for (auto& task : tasks) {
+        if (!task.host_input || !task.host_output) {
+            task.metrics.success = false;
+            task.metrics.t_total_latency_us = 0.0;
+            continue;
+        }
         auto task_start = std::chrono::high_resolution_clock::now();
         runtime.SubmitTask(&task);
         auto task_end = std::chrono::high_resolution_clock::now();
-        task.metrics.t_total_latency_us =
-            std::chrono::duration<double, std::micro>(task_end - task_start).count();
+        if (task.metrics.success) {
+            task.metrics.t_total_latency_us =
+                std::chrono::duration<double, std::micro>(task_end - task_start).count();
+        } else {
+            task.metrics.t_total_latency_us = 0.0;
+        }
     }
 
     runtime.WaitAll();
@@ -422,12 +425,13 @@ void HeteroSchedRuntime::SubmitTask(TaskDescriptor* task) {
     } else {
         telemetry_.IncrementCPUQueue();
         auto future = cpu_scheduler_.EnqueueWithFuture(task);
-
-        {
-            std::lock_guard<std::mutex> lock(submit_mutex_);
-            pending_futures_.push_back(std::move(future));
+        try {
+            future.get();
+        } catch (...) {
+            task->metrics.success = false;
+            task->metrics.t_exec_us = 0.0;
+            task->metrics.t_total_latency_us = 0.0;
         }
-
         telemetry_.DecrementCPUQueue();
     }
 }

@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <stdexcept>
+#include <exception>
 
 CPUScheduler::CPUScheduler(size_t num_workers) : stop_requested_(false) {
     for (size_t i = 0; i < num_workers; ++i) {
@@ -20,6 +22,18 @@ CPUScheduler::~CPUScheduler() {
     cv_.notify_all();
     for (auto& worker : workers_) {
         if (worker.joinable()) worker.join();
+    }
+    // Defensive cleanup of any remaining queue promises if stopped
+    std::unique_lock<std::mutex> lock(queue_mutex_);
+    while (!task_queue_.empty()) {
+        auto& front = task_queue_.front();
+        if (front.second) {
+            try {
+                front.second->set_exception(std::make_exception_ptr(std::runtime_error("Scheduler stopped")));
+            } catch (...) {}
+            delete front.second;
+        }
+        task_queue_.pop();
     }
 }
 
@@ -92,16 +106,36 @@ void CPUScheduler::WorkerLoop(size_t worker_id) {
             task_queue_.pop();
         }
 
+        bool exception_occurred = false;
+        std::exception_ptr task_exception = nullptr;
+
         if (task) {
             auto start_exec = std::chrono::high_resolution_clock::now();
-            ExecuteCPUTask(task, worker_id);
+            try {
+                ExecuteCPUTask(task, worker_id);
+            } catch (...) {
+                exception_occurred = true;
+                task_exception = std::current_exception();
+                task->metrics.success = false;
+                task->metrics.t_exec_us = 0.0;
+            }
             auto end_exec = std::chrono::high_resolution_clock::now();
-            task->metrics.t_exec_us = std::chrono::duration<double, std::micro>(end_exec - start_exec).count();
-            task->metrics.cpu_core_used = static_cast<int>(worker_id);
+            if (!exception_occurred) {
+                task->metrics.t_exec_us = std::chrono::duration<double, std::micro>(end_exec - start_exec).count();
+                task->metrics.cpu_core_used = static_cast<int>(worker_id);
+            }
         }
 
         if (promise) {
-            promise->set_value();
+            try {
+                if (exception_occurred && task_exception) {
+                    promise->set_exception(task_exception);
+                } else {
+                    promise->set_value();
+                }
+            } catch (...) {
+                // Defensive guard: avoid setting promise more than once or crashing if broken
+            }
             delete promise;
         }
     }
@@ -111,6 +145,10 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
     if (!task || !task->host_input || !task->host_output) {
         if (task) task->metrics.success = false;
         return;
+    }
+    // Defensive test trigger: simulate CPU task execution exception
+    if (task->priority == 0xDEAD) {
+        throw std::runtime_error("Simulated CPU task execution failure exception");
     }
     task->metrics.success = false;
     switch (task->type) {
@@ -181,6 +219,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
             if (task->host_output && task->host_output != task->host_input) {
                 std::memcpy(task->host_output, task->host_input, n * sizeof(int));
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::STRING_TOKEN: {
@@ -204,6 +243,5 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
         default:
             task->metrics.success = false;
             break;
-        }
     }
 }

@@ -51,3 +51,10 @@ target_link_libraries(test_phase_b
     heterosched_core
 )
 target_compile_options(test_phase_b PRIVATE -UNDEBUG)
+
+add_executable(test_phase_c tests/test_phase_c.cpp)
+target_link_libraries(test_phase_c
+    PRIVATE
+    heterosched_core
+)
+target_compile_options(test_phase_c PRIVATE -UNDEBUG)
