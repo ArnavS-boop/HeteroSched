@@ -49,10 +49,35 @@ size_t CPUScheduler::PendingTasks() {
 }
 
 void CPUScheduler::WorkerLoop(size_t worker_id) {
+    unsigned int hw_concurrency = std::thread::hardware_concurrency();
+    size_t fallback_cores = (hw_concurrency > 0) ? hw_concurrency : 1;
+
+    cpu_set_t process_cpuset;
+    CPU_ZERO(&process_cpuset);
+    int get_rc = pthread_getaffinity_np(pthread_self(), sizeof(cpu_set_t), &process_cpuset);
+
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
-    CPU_SET(worker_id % std::thread::hardware_concurrency(), &cpuset);
-    pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+
+    if (get_rc == 0 && CPU_COUNT(&process_cpuset) > 0) {
+        std::vector<int> available_cpus;
+        for (int i = 0; i < CPU_SETSIZE; ++i) {
+            if (CPU_ISSET(i, &process_cpuset)) {
+                available_cpus.push_back(i);
+            }
+        }
+        if (!available_cpus.empty()) {
+            int selected_cpu = available_cpus[worker_id % available_cpus.size()];
+            CPU_SET(selected_cpu, &cpuset);
+        } else {
+            CPU_SET(static_cast<int>(worker_id % fallback_cores), &cpuset);
+        }
+    } else {
+        CPU_SET(static_cast<int>(worker_id % fallback_cores), &cpuset);
+    }
+
+    int set_rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+    (void)set_rc;
 
     while (true) {
         TaskDescriptor* task = nullptr;
@@ -83,6 +108,11 @@ void CPUScheduler::WorkerLoop(size_t worker_id) {
 }
 
 void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
+    if (!task || !task->host_input || !task->host_output) {
+        if (task) task->metrics.success = false;
+        return;
+    }
+    task->metrics.success = false;
     switch (task->type) {
         case TaskType::SGEMM: {
             float* A = reinterpret_cast<float*>(task->host_input);
@@ -97,6 +127,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                     C[i * task->dim_n + j] = sum;
                 }
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::CONV2D: {
@@ -124,6 +155,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                     output[i * w + j] = sum / static_cast<float>(count);
                 }
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::SPMV: {
@@ -139,6 +171,7 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                 }
                 out[i] = sum;
             }
+            task->metrics.success = true;
             break;
         }
         case TaskType::QUICKSORT: {
@@ -165,6 +198,11 @@ void CPUScheduler::ExecuteCPUTask(TaskDescriptor* task, size_t /*core_id*/) {
                 }
             }
             *token_count = tokens;
+            task->metrics.success = true;
+            break;
+        }
+        default:
+            task->metrics.success = false;
             break;
         }
     }

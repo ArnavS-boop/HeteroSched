@@ -8,6 +8,12 @@ GatedController::GatedController(std::unique_ptr<DecisionForestModel> model)
 ExecutionDevice GatedController::ScheduleTask(TaskDescriptor* task, const RuntimeState& state) {
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    if (task->type == TaskType::QUICKSORT || task->type == TaskType::STRING_TOKEN) {
+        task->metrics.assigned_device = ExecutionDevice::DEVICE_CPU;
+        record_decision_overhead(task, start_time);
+        return ExecutionDevice::DEVICE_CPU;
+    }
+
     if (tier1_enabled_) {
         double operational_intensity = static_cast<double>(task->estimated_flops) /
                                        (task->bytes_in + task->bytes_out + 1.0);

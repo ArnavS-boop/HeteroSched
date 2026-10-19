@@ -19,30 +19,31 @@ enum class ExecutionDevice {
 };
 
 struct TaskExecutionMetrics {
-    uint64_t task_id;
-    ExecutionDevice assigned_device;
-    double t_decision_us;
-    double t_transfer_us;
-    double t_exec_us;
-    double t_sync_us;
-    double t_total_latency_us;
-    uint32_t stream_id_used;
-    int cpu_core_used;
+    uint64_t task_id = 0;
+    ExecutionDevice assigned_device = ExecutionDevice::DEVICE_CPU;
+    double t_decision_us = 0.0;
+    double t_transfer_us = 0.0;
+    double t_exec_us = 0.0;
+    double t_sync_us = 0.0;
+    double t_total_latency_us = 0.0;
+    uint32_t stream_id_used = 0;
+    int cpu_core_used = -1;
+    bool success = false;
 };
 
 struct TaskDescriptor {
-    uint64_t task_id;
-    TaskType type;
-    uint32_t priority;
-    size_t dim_m;
-    size_t dim_n;
-    size_t dim_k;
-    size_t bytes_in;
-    size_t bytes_out;
-    uint64_t estimated_flops;
-    void* host_input;
-    void* host_output;
-    TaskExecutionMetrics metrics;
+    uint64_t task_id = 0;
+    TaskType type = TaskType::SGEMM;
+    uint32_t priority = 0;
+    size_t dim_m = 0;
+    size_t dim_n = 0;
+    size_t dim_k = 0;
+    size_t bytes_in = 0;
+    size_t bytes_out = 0;
+    uint64_t estimated_flops = 0;
+    void* host_input = nullptr;
+    void* host_output = nullptr;
+    TaskExecutionMetrics metrics{};
 };
 
 struct RuntimeState {

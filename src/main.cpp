@@ -9,7 +9,7 @@
 #include <chrono>
 #include <cstdlib>
 
-void allocate_task_buffers(TaskDescriptor* task);
+bool allocate_task_buffers(TaskDescriptor* task);
 void free_task_buffers(TaskDescriptor* task);
 void gpu_warmup();
 void print_gpu_info();
@@ -176,7 +176,10 @@ int main(int argc, char** argv) {
         t.bytes_in = e.bytes_in;
         t.bytes_out = e.bytes_out;
         t.estimated_flops = e.estimated_flops;
-        allocate_task_buffers(&t);
+        bool alloc_ok = allocate_task_buffers(&t);
+        if (!alloc_ok) {
+            std::cerr << "Warning: Failed to allocate buffers for task ID " << t.task_id << std::endl;
+        }
     }
 
     HeteroSchedConfig config;
@@ -231,6 +234,11 @@ HeteroSchedRuntime::~HeteroSchedRuntime() {
 }
 
 void HeteroSchedRuntime::SubmitTask(TaskDescriptor* task) {
+    if (!task) return;
+    if (!task->host_input || !task->host_output) {
+        task->metrics.success = false;
+        return;
+    }
     RuntimeState state = telemetry_.Snapshot();
     ExecutionDevice device = controller_.ScheduleTask(task, state);
 
