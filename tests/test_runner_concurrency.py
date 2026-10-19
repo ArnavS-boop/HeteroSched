@@ -31,6 +31,9 @@ from server.runner import (
 from server.app import app
 
 
+_CREATED_MOCK_FILES = []
+
+
 def _create_mock_csv(output_path):
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(
@@ -40,6 +43,7 @@ def _create_mock_csv(output_path):
             "0,SGEMM,2,256,256,256,GPU,0.5,100,500,0,600,0,0\n\n"
             "# total_time_ms,1.5\n"
         )
+    _CREATED_MOCK_FILES.append(output_path)
 
 
 class TestRunnerConcurrency(unittest.TestCase):
@@ -59,6 +63,16 @@ class TestRunnerConcurrency(unittest.TestCase):
         for t in self.active_threads:
             if t.is_alive():
                 t.join(timeout=5.0)
+
+        # Clean up any mock run files created during tests
+        global _CREATED_MOCK_FILES
+        for p in _CREATED_MOCK_FILES:
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        _CREATED_MOCK_FILES.clear()
 
         # Assert that the runner has naturally returned to a clean state
         status = get_current_status()
@@ -221,6 +235,89 @@ class TestRunnerConcurrency(unittest.TestCase):
         final_res = self.client.get("/api/benchmark/status")
         self.assertEqual(final_res.status_code, 200)
         self.assertFalse(final_res.get_json()["is_running"])
+
+
+    def test_benchmark_run_does_not_overwrite_or_touch_root_results_csv(self):
+        """Verify benchmark execution saves to server/runs/ and does NOT touch repository root results.csv."""
+        root_csv_path = os.path.join(REPO_ROOT, "results.csv")
+        root_csv_exists = os.path.exists(root_csv_path)
+        initial_content = None
+        initial_mtime = None
+        if root_csv_exists:
+            with open(root_csv_path, "r", encoding="utf-8") as f:
+                initial_content = f.read()
+            initial_mtime = os.path.getmtime(root_csv_path)
+
+        def mock_run(cmd, *args, **kwargs):
+            _create_mock_csv(cmd[4])
+            mock_proc = MagicMock()
+            mock_proc.returncode = 0
+            mock_proc.stdout = "Mock benchmark completed successfully"
+            mock_proc.stderr = ""
+            return mock_proc
+
+        with patch("server.runner.subprocess.run", side_effect=mock_run):
+            res = self.client.post("/api/benchmark/run", json={"trace": "mixed"})
+            self.assertEqual(res.status_code, 200)
+            data = res.get_json()
+            self.assertTrue(data.get("success"))
+
+            # Verify that run output file exists in server/runs/
+            run_output_path = data["run"]["output_csv_path"]
+            self.assertTrue(os.path.exists(run_output_path))
+            self.assertIn("server/runs", run_output_path.replace("\\", "/"))
+
+            # Verify root results.csv was NOT touched or overwritten
+            if root_csv_exists:
+                self.assertTrue(os.path.exists(root_csv_path), "Root results.csv was unexpectedly removed")
+                with open(root_csv_path, "r", encoding="utf-8") as f:
+                    current_content = f.read()
+                self.assertEqual(current_content, initial_content, "Root results.csv was modified or overwritten by benchmark run!")
+                self.assertEqual(os.path.getmtime(root_csv_path), initial_mtime, "Root results.csv mtime changed!")
+
+            # Verify GET /api/benchmark/latest points to run file, not root results.csv
+            latest_res = self.client.get("/api/benchmark/latest")
+            self.assertEqual(latest_res.status_code, 200)
+            latest_data = latest_res.get_json()
+            self.assertEqual(latest_data["output_csv_path"], run_output_path)
+            self.assertTrue(latest_data["is_fresh"])
+
+            # Verify GET /api/benchmark/download downloads the run data successfully
+            dl_res = self.client.get("/api/benchmark/download?mode=raw")
+            self.assertEqual(dl_res.status_code, 200)
+            self.assertIn("task_id,type,priority", dl_res.get_data(as_text=True))
+
+    def test_failed_benchmark_run_does_not_touch_root_results_csv_and_restores_state(self):
+        """Verify benchmark execution failure does not touch root results.csv and restores locks."""
+        root_csv_path = os.path.join(REPO_ROOT, "results.csv")
+        root_csv_exists = os.path.exists(root_csv_path)
+        initial_content = None
+        if root_csv_exists:
+            with open(root_csv_path, "r", encoding="utf-8") as f:
+                initial_content = f.read()
+
+        def mock_failed_run(cmd, *args, **kwargs):
+            mock_proc = MagicMock()
+            mock_proc.returncode = 1
+            mock_proc.stdout = ""
+            mock_proc.stderr = "Fatal GPU simulation fault"
+            return mock_proc
+
+        with patch("server.runner.subprocess.run", side_effect=mock_failed_run):
+            res = self.client.post("/api/benchmark/run", json={"trace": "mixed"})
+            self.assertEqual(res.status_code, 500)
+
+            # Root results.csv must remain untouched
+            if root_csv_exists:
+                with open(root_csv_path, "r", encoding="utf-8") as f:
+                    current_content = f.read()
+                self.assertEqual(current_content, initial_content, "Root results.csv modified during failure path!")
+
+            # Status and lock must be restored
+            status = get_current_status()
+            self.assertFalse(status["is_running"])
+            self.assertIsNone(status["current_trace"])
+            self.assertFalse(_BENCHMARK_LOCK.locked())
 
 
 if __name__ == "__main__":

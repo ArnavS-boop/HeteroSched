@@ -6,7 +6,6 @@ Also serves the built frontend production bundle if present.
 """
 
 import os
-import shutil
 from datetime import datetime, timezone
 from flask import Flask, jsonify, request, Response, send_from_directory
 from flask_cors import CORS
@@ -166,12 +165,6 @@ def run_benchmark():
             "stdout": run_meta.get("stdout", ""),
             "stderr": run_meta.get("stderr", ""),
         }), 500
-
-    # Also safely update root results.csv without touching original run file
-    try:
-        shutil.copyfile(run_meta["output_csv_path"], os.path.join(WORKSPACE_ROOT, "results.csv"))
-    except Exception:
-        pass
 
     # Store latest run with explicit fresh flag and source identifier
     _LATEST_RUN["is_fresh"] = True
